@@ -1,4 +1,4 @@
-![Inboundr TypeScript SDK — signed webhooks, verified in one call](https://raw.githubusercontent.com/inboundr-net/inboundr/main/assets/banner.png)
+![Inboundr TypeScript SDK — signed webhooks, verified in one call](https://raw.githubusercontent.com/inboundr-net/inboundr/refs/heads/main/assets/banner.png)
 
 [![npm](https://img.shields.io/npm/v/inboundr?color=0f766e&label=npm)](https://www.npmjs.com/package/inboundr)
 [![dependencies](https://img.shields.io/badge/dependencies-0-0f766e)](./package.json)
