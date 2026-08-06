@@ -1,0 +1,24 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    // No "node" lib and no @types/node on purpose. Everything this package
+    // touches — crypto.subtle, fetch, Request, TextEncoder — is a web global,
+    // so the types come from "DOM" and the code runs unchanged on Node, Bun,
+    // Deno, Cloudflare Workers and Vercel Edge. Pulling in @types/node would
+    // let a `node:`-only API compile here and then fail at runtime on a worker.
+    "lib": ["ES2022", "DOM"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "outDir": "dist",
+    "rootDir": "src",
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true
+  },
+  "include": ["src/**/*.ts"]
+}

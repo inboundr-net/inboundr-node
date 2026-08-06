@@ -1,0 +1,9 @@
+node_modules/
+
+# Build output. Published to npm from CI, never committed — a stale dist in the
+# tree is how a published package ends up not matching its source.
+dist/
+
+*.tsbuildinfo
+.DS_Store
+npm-debug.log*

@@ -1,0 +1,68 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # The matrix is the point, not ceremony. This package claims to run on any
+      # runtime with `fetch` and `crypto.subtle` and it has no dependencies to
+      # paper over a gap, so the floor named in `engines` has to be tested
+      # rather than assumed. Node 18 is the oldest version we promise; drop it
+      # here and from `engines` in the same commit, never just one.
+      matrix:
+        node: ["18", "20", "22"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      # `npm install`, not `npm ci`, because no lockfile is committed yet. Once
+      # one is, switch this to `npm ci` and add `cache: npm` above — CI that
+      # resolves fresh on every run can pass against a dependency tree no
+      # developer has.
+      - run: npm install --no-audit --no-fund
+      - run: npm test
+
+  publish:
+    # Tags only, and only after the whole matrix is green.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required for npm provenance, which attests on the public registry that
+      # this tarball was built from this commit in this repo. Free trust signal
+      # for a package asking people to route their mail through it.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - run: npm install --no-audit --no-fund
+
+      # Guard against the mismatch that is only discoverable after the fact:
+      # npm publishes whatever `version` says, ignoring the tag entirely, so
+      # tagging v0.2.0 with 0.1.0 in package.json silently republishes nothing
+      # useful and burns the tag.
+      - name: Tag must match package version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p 'require("./package.json").version')"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::tag v$tag does not match package.json version $pkg"
+            exit 1
+          fi
+
+      - run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
