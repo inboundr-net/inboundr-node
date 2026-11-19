@@ -1,15 +1,15 @@
 {
   "name": "inboundr",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "TypeScript SDK for Inboundr — inbound email for AI agents. Verify webhook signatures and call the REST API.",
   "license": "MIT",
   "author": "inboundr <dev@inboundr.net>",
   "homepage": "https://inboundr.net",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/inboundr-net/inboundr.git"
+    "url": "git+https://github.com/inboundr-net/inboundr-node.git"
   },
-  "bugs": "https://github.com/inboundr-net/inboundr/issues",
+  "bugs": "https://github.com/inboundr-net/inboundr-node/issues",
   "keywords": [
     "email",
     "inbound-email",
@@ -39,10 +39,15 @@
   },
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.json",
-    "test": "npm run build && node tests/webhook.test.mjs && node tests/client.test.mjs",
+    "test": "npm run spec:check && npm run build && node tests/webhook.test.mjs && node tests/client.test.mjs && node tests/spec.test.mjs && tsc -p tests/tsconfig.json",
+    "spec:sync": "node scripts/spec.mjs sync",
+    "spec:types": "node scripts/spec.mjs types",
+    "spec:check": "node scripts/spec.mjs check",
     "prepublishOnly": "npm test"
   },
   "devDependencies": {
-    "typescript": "^5"
+    "js-yaml": "4.3.2",
+    "openapi-typescript": "7.13.0",
+    "typescript": "5.9.3"
   }
 }

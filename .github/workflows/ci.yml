@@ -24,11 +24,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
-      # `npm install`, not `npm ci`, because no lockfile is committed yet. Once
-      # one is, switch this to `npm ci` and add `cache: npm` above — CI that
-      # resolves fresh on every run can pass against a dependency tree no
-      # developer has.
-      - run: npm install --no-audit --no-fund
+          cache: npm
+      # `npm ci` against the committed lockfile: CI that resolves fresh on every
+      # run can pass against a dependency tree no developer has. Dev-only — the
+      # published package still has no dependencies.
+      - run: npm ci --no-audit --no-fund
+      # Includes spec:check, so a hand-edited src/generated/api.ts, or a spec
+      # copied in without regenerating, fails here.
       - run: npm test
 
   publish:
@@ -48,7 +50,8 @@ jobs:
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
-      - run: npm install --no-audit --no-fund
+          cache: npm
+      - run: npm ci --no-audit --no-fund
 
       # Guard against the mismatch that is only discoverable after the fact:
       # npm publishes whatever `version` says, ignoring the tag entirely, so

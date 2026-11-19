@@ -3,7 +3,9 @@
  *
  * A thin, typed wrapper over `/api/v1` — deliberately thin. It adds the bearer
  * header, encodes query strings, turns non-2xx into typed errors and gives you
- * response types; it does not retry, cache, poll or hold state. There is no
+ * response types, all generated from the API's OpenAPI description. It does
+ * not retry, cache or hold state; the only thing that makes more than one
+ * request is a `listAll*` iterator, and only as you iterate it. There is no
  * hidden behaviour to reason about when a call does something you didn't expect.
  *
  * Retries are the notable omission. A blind retry is wrong for half of these
@@ -25,12 +27,14 @@ import type {
   Address,
   AttachmentUrl,
   CreateAddressParams,
-  CreatedDomain,
+  CreateDomainParams,
+  CreatedAddress,
   CreateEndpointParams,
   CreateShieldRuleParams,
   CreateSuppressionParams,
-  Domain,
+  Delivery,
   DomainDetail,
+  Domain,
   Email,
   EmailSummary,
   Endpoint,
@@ -39,13 +43,21 @@ import type {
   ForwardDestination,
   ForwardDestinationRequest,
   List,
+  ListDeliveriesParams,
   ListEmailsParams,
   Page,
+  ReplaceShieldRuleParams,
+  ReplyParams,
+  Sender,
   SendEmailParams,
+  SentEmail,
   ShieldRule,
+  ShieldRuleOrder,
   Suppression,
   Thread,
   UpdateAddressParams,
+  UpdateDomainParams,
+  UpdatedDomain,
   UpdateEndpointParams,
 } from "./types.js";
 
@@ -128,6 +140,8 @@ function toQueryString(params: Record<string, unknown> | undefined): string {
 type RequestOptions = {
   query?: Record<string, unknown>;
   body?: unknown;
+  /** Return the successful Response untouched, for a binary download. */
+  raw?: boolean;
 };
 
 /** The bound transport each resource group is handed. */
@@ -144,6 +158,7 @@ export class Inboundr {
   readonly addresses: AddressesResource;
   readonly endpoints: EndpointsResource;
   readonly shieldRules: ShieldRulesResource;
+  readonly senders: SendersResource;
   readonly suppressions: SuppressionsResource;
   readonly forwardDestinations: ForwardDestinationsResource;
 
@@ -188,6 +203,7 @@ export class Inboundr {
     this.addresses = new AddressesResource(request);
     this.endpoints = new EndpointsResource(request);
     this.shieldRules = new ShieldRulesResource(request);
+    this.senders = new SendersResource(request);
     this.suppressions = new SuppressionsResource(request);
     this.forwardDestinations = new ForwardDestinationsResource(request);
   }
@@ -240,6 +256,8 @@ export class Inboundr {
 
     const requestId = response.headers.get("x-request-id");
 
+    if (options.raw && response.ok) return response as T;
+
     // 204 is the documented success for every delete. Reading a body that isn't
     // there and parsing "" as JSON would throw on the happy path.
     if (response.status === 204) return undefined as T;
@@ -286,15 +304,45 @@ function segment(value: string): string {
   return encodeURIComponent(value);
 }
 
+/**
+ * Walks a keyset-paginated listing, one request per page, yielding items.
+ *
+ * Pages are fetched lazily as you iterate, so breaking out of the loop stops
+ * the requests. Each page is a call against the account's shared rate limit;
+ * a long walk can run into it, and the error surfaces from the loop.
+ */
+async function* paginate<T, P extends { cursor?: string }>(
+  params: P,
+  fetchPage: (params: P) => Promise<Page<T>>,
+): AsyncGenerator<T, void, undefined> {
+  let cursor = params.cursor;
+  do {
+    const page = await fetchPage({ ...params, cursor });
+    yield* page.data;
+    cursor = page.nextCursor ?? undefined;
+  } while (cursor);
+}
+
 class EmailsResource {
   constructor(private readonly request: Requester) {}
 
   /**
-   * Newest first, with keyset pagination. Bodies are omitted — use
+   * One page, newest first. Bodies are omitted — use
    * {@link EmailsResource.get} for those.
    */
   list(params: ListEmailsParams = {}): Promise<Page<EmailSummary>> {
     return this.request("GET", "/emails", { query: params });
+  }
+
+  /**
+   * Every matching email, newest first, fetching pages as you iterate.
+   *
+   * ```ts
+   * for await (const email of inboundr.emails.listAll({ direction: "inbound" })) { … }
+   * ```
+   */
+  listAll(params: ListEmailsParams = {}): AsyncGenerator<EmailSummary> {
+    return paginate(params, (p) => this.list(p));
   }
 
   /** One email with bodies, attachment metadata and verdicts. */
@@ -302,9 +350,21 @@ class EmailsResource {
     return this.request("GET", `/emails/${segment(id)}`);
   }
 
-  /** Sends from an address on a verified domain. Requires text or html. */
-  send(params: SendEmailParams): Promise<Email> {
+  /**
+   * Sends through a connected sender, or from a verified domain where outbound
+   * is enabled. Requires `text` or `html`. Not idempotent: retrying a send that
+   * timed out can deliver it twice.
+   */
+  send(params: SendEmailParams): Promise<SentEmail> {
     return this.request("POST", "/emails", { body: params });
+  }
+
+  /**
+   * Answers a received email. Recipients, subject and threading headers come
+   * from the stored message; `replyAll` adds its other recipients.
+   */
+  reply(id: string, params: ReplyParams): Promise<SentEmail> {
+    return this.request("POST", `/emails/${segment(id)}/reply`, { body: params });
   }
 
   /** Deletes the stored message and its objects. Not recoverable. */
@@ -314,7 +374,7 @@ class EmailsResource {
 
   /**
    * Re-fires this message's failed webhook deliveries. Returns how many were
-   * queued — `{ retried: 0 }` means nothing was in a retryable state.
+   * retried — `{ retried: 0 }` means nothing was in a retryable state.
    */
   retry(id: string): Promise<{ retried: number }> {
     return this.request("POST", `/emails/${segment(id)}/retry`);
@@ -325,12 +385,28 @@ class EmailsResource {
    * `attachments` array.
    *
    * Fails for an attachment whose `stored` is false — nothing was kept to
-   * download. The URL expires in minutes; fetch it now rather than storing it.
+   * download. The URL expires in 15 minutes; fetch it now rather than storing it.
    */
   attachmentUrl(emailId: string, index: number): Promise<AttachmentUrl> {
     return this.request(
       "GET",
       `/emails/${segment(emailId)}/attachments/${index}`,
+    );
+  }
+
+  /**
+   * The attachment's bytes, streamed through the API instead of a signed
+   * storage URL — for a client that can't reach the storage host.
+   *
+   * Returns the `Response`: read it with `.arrayBuffer()`, `.blob()`, or pipe
+   * `.body`. `content-type` and `content-disposition` carry the file's type and
+   * name.
+   */
+  downloadAttachment(emailId: string, index: number): Promise<Response> {
+    return this.request(
+      "GET",
+      `/emails/${segment(emailId)}/attachments/${index}`,
+      { query: { download: "1" }, raw: true },
     );
   }
 }
@@ -353,24 +429,23 @@ class DomainsResource {
 
   /**
    * Registers a domain. It lands `pending`; publish the returned `dnsRecords`
-   * and it verifies on its own from there.
+   * and poll {@link DomainsResource.get} until `state` is `verified`.
    */
-  create(params: { domain: string }): Promise<CreatedDomain> {
+  create(params: CreateDomainParams): Promise<DomainDetail> {
     return this.request("POST", "/domains", { body: params });
   }
 
+  /** Re-checks verification, so polling this is how you learn a domain is ready. */
   get(id: string): Promise<DomainDetail> {
     return this.request("GET", `/domains/${segment(id)}`);
   }
 
   /**
-   * Sets the catch-all wiring. `catchAllEndpointIds: []` turns catch-all off;
-   * a non-empty list makes every unmatched address on the domain deliver there.
+   * Sets the catch-all endpoints. `catchAllEndpointIds: []` turns catch-all
+   * off; a non-empty list makes every unrouted address on the domain deliver
+   * there.
    */
-  update(
-    id: string,
-    params: { catchAllEndpointIds?: string[] },
-  ): Promise<DomainDetail> {
+  update(id: string, params: UpdateDomainParams): Promise<UpdatedDomain> {
     return this.request("PATCH", `/domains/${segment(id)}`, { body: params });
   }
 
@@ -387,7 +462,8 @@ class AddressesResource {
     return this.request("GET", "/addresses");
   }
 
-  create(params: CreateAddressParams): Promise<Address> {
+  /** With no `endpointIds` the address is store-only: kept, not delivered. */
+  create(params: CreateAddressParams): Promise<CreatedAddress> {
     return this.request("POST", "/addresses", { body: params });
   }
 
@@ -395,6 +471,7 @@ class AddressesResource {
     return this.request("GET", `/addresses/${segment(id)}`);
   }
 
+  /** `endpointIds` replaces the whole set; `[]` makes the address store-only. */
   update(id: string, params: UpdateAddressParams): Promise<Address> {
     return this.request("PATCH", `/addresses/${segment(id)}`, { body: params });
   }
@@ -407,14 +484,14 @@ class AddressesResource {
 class EndpointsResource {
   constructor(private readonly request: Requester) {}
 
-  /** Secrets are redacted here — they exist only in the create response. */
+  /** Secrets are never included — they exist only in the create response. */
   list(): Promise<List<Endpoint>> {
     return this.request("GET", "/endpoints");
   }
 
   /**
    * Creates an endpoint. **The response is the only time `secret` is ever
-   * returned** — store it now; it cannot be read back, only rotated.
+   * returned** — store it now; it cannot be read back.
    */
   create(params: CreateEndpointParams): Promise<EndpointWithSecret> {
     return this.request("POST", "/endpoints", { body: params });
@@ -424,10 +501,12 @@ class EndpointsResource {
     return this.request("GET", `/endpoints/${segment(id)}`);
   }
 
+  /** A partial update: send only the fields you are changing. */
   update(id: string, params: UpdateEndpointParams): Promise<Endpoint> {
     return this.request("PATCH", `/endpoints/${segment(id)}`, { body: params });
   }
 
+  /** Removes the endpoint and its delivery history. */
   delete(id: string): Promise<void> {
     return this.request("DELETE", `/endpoints/${segment(id)}`);
   }
@@ -437,17 +516,38 @@ class EndpointsResource {
    *
    * The payload is a real `email.received` envelope carrying a placeholder
    * message, signed with the endpoint's live secret — so this exercises your
-   * verification code, not just your URL.
+   * verification code, not just your URL. Webhook, Slack and Discord only.
    */
   test(id: string): Promise<EndpointTestResult> {
     return this.request("POST", `/endpoints/${segment(id)}/test`);
+  }
+
+  /**
+   * One page of this endpoint's deliveries, newest first. `failed` is still
+   * being retried; `dead` has run out of attempts.
+   */
+  deliveries(
+    id: string,
+    params: ListDeliveriesParams = {},
+  ): Promise<Page<Delivery>> {
+    return this.request("GET", `/endpoints/${segment(id)}/deliveries`, {
+      query: params,
+    });
+  }
+
+  /** Every matching delivery, newest first, fetching pages as you iterate. */
+  listAllDeliveries(
+    id: string,
+    params: ListDeliveriesParams = {},
+  ): AsyncGenerator<Delivery> {
+    return paginate(params, (p) => this.deliveries(id, p));
   }
 }
 
 class ShieldRulesResource {
   constructor(private readonly request: Requester) {}
 
-  /** In evaluation order: lower `priority` first. */
+  /** In evaluation order. The first rule that matches a message wins. */
   list(): Promise<List<ShieldRule>> {
     return this.request("GET", "/shield-rules");
   }
@@ -461,10 +561,19 @@ class ShieldRulesResource {
     return this.request("GET", `/shield-rules/${segment(id)}`);
   }
 
-  update(
-    id: string,
-    params: Partial<CreateShieldRuleParams>,
-  ): Promise<ShieldRule> {
+  /**
+   * Replaces the rule. A full replace, not a merge — but a rule from
+   * {@link ShieldRulesResource.get} can be passed back with changes, since its
+   * read-only fields are accepted and ignored:
+   *
+   * ```ts
+   * const rule = await inboundr.shieldRules.get(id);
+   * await inboundr.shieldRules.update(id, { ...rule, enabled: false });
+   * ```
+   *
+   * Its place in the order doesn't change; use `move` or `reorder` for that.
+   */
+  update(id: string, params: ReplaceShieldRuleParams): Promise<ShieldRule> {
     return this.request("PUT", `/shield-rules/${segment(id)}`, { body: params });
   }
 
@@ -473,21 +582,44 @@ class ShieldRulesResource {
   }
 
   /**
+   * Swaps the rule with its neighbour. Moving past either end does nothing.
+   * Returns the full order afterwards.
+   */
+  move(id: string, direction: "up" | "down"): Promise<ShieldRuleOrder> {
+    return this.request("POST", `/shield-rules/${segment(id)}/move`, {
+      body: { direction },
+    });
+  }
+
+  /**
    * Replaces the whole evaluation order.
    *
    * `order` must be a permutation of *every* rule on the account — a partial
-   * list is rejected rather than applied, so a client working from a stale read
-   * gets an error instead of quietly reordering rules it never saw.
+   * list is rejected with a 409 rather than applied, so a client working from
+   * a stale read gets an error instead of quietly reordering rules it never saw.
    */
-  reorder(order: string[]): Promise<{ order: string[] }> {
+  reorder(order: string[]): Promise<ShieldRuleOrder> {
     return this.request("PUT", "/shield-rules", { body: { order } });
+  }
+}
+
+class SendersResource {
+  constructor(private readonly request: Requester) {}
+
+  /**
+   * Senders connected in the console, so an agent can tell which From
+   * addresses it may use. Read-only: credentials are added in the console,
+   * never through an API key.
+   */
+  list(): Promise<List<Sender>> {
+    return this.request("GET", "/senders");
   }
 }
 
 class SuppressionsResource {
   constructor(private readonly request: Requester) {}
 
-  /** Addresses this account can no longer send to, newest first. */
+  /** Addresses this account can no longer send to. Not on the Free plan. */
   list(): Promise<List<Suppression>> {
     return this.request("GET", "/suppressions");
   }
@@ -517,17 +649,20 @@ class ForwardDestinationsResource {
   }
 
   /**
-   * Asks an address to confirm it will accept forwarded mail, or re-asks.
+   * Asks an address to confirm it will accept forwarded mail, or re-asks
+   * (which invalidates earlier confirmation links).
    *
-   * Consent is required before a forwarding endpoint may use the address, so
-   * this is a prerequisite for `endpoints.create({ type: "forward" })` — not a
-   * formality that can be skipped.
+   * Nothing is forwarded to an address until it confirms, so this is a
+   * prerequisite for `endpoints.create({ type: "forward" })`.
    */
   create(params: { address: string }): Promise<ForwardDestinationRequest> {
     return this.request("POST", "/forward-destinations", { body: params });
   }
 
-  /** Withdraws consent. Endpoints forwarding there stop doing so. */
+  /**
+   * Withdraws consent. Endpoints keep the address, but nothing is delivered to
+   * it until it confirms again.
+   */
   delete(address: string): Promise<void> {
     return this.request("DELETE", `/forward-destinations/${segment(address)}`);
   }

@@ -1,4 +1,4 @@
-![Inboundr TypeScript SDK — signed webhooks, verified in one call](https://raw.githubusercontent.com/inboundr-net/inboundr/refs/heads/main/assets/banner.png)
+![Inboundr TypeScript SDK — signed webhooks, verified in one call](https://raw.githubusercontent.com/inboundr-net/inboundr-node/refs/heads/main/assets/banner.png)
 
 [![npm](https://img.shields.io/npm/v/inboundr?color=0f766e&label=npm)](https://www.npmjs.com/package/inboundr)
 [![dependencies](https://img.shields.io/badge/dependencies-0-0f766e)](./package.json)
@@ -72,32 +72,54 @@ export async function POST(req: Request) {
 Express, Fastify, a queue consumer replaying a stored payload:
 
 ```ts
-import { verifyWebhookPayload, SIGNATURE_HEADER } from "inboundr";
+import { verifyWebhookPayload } from "inboundr";
 
 app.post("/inbound", express.raw({ type: "application/json" }), async (req, res) => {
   const { email } = await verifyWebhookPayload(
-    req.body.toString("utf8"),
-    req.get(SIGNATURE_HEADER),
+    req.body,     // the raw Buffer
+    req.headers,  // reads the signature header, legacy name included
     process.env.INBOUNDR_WEBHOOK_SECRET,
   );
   res.sendStatus(204);
 });
 ```
 
-`express.raw()`, not `express.json()`. The signature covers the bytes we sent, and `JSON.stringify(JSON.parse(body))` is a different set of bytes.
+`express.raw()`, not `express.json()`. The signature covers the bytes we sent, and `JSON.stringify(JSON.parse(body))` is a different set of bytes; an already-parsed body fails with `body_already_read`. The body can be a string or the raw bytes, and the second argument can be the header value or the request's headers in any shape — a web `Headers`, a polyfill, or Node's plain `req.headers`.
 
 ### Handling retries safely
 
 Retries reuse the delivery id, so that is the key to dedupe on:
 
 ```ts
-import { DELIVERY_ID_HEADER } from "inboundr";
+import { readWebhookHeaders } from "inboundr";
 
-const deliveryId = req.headers.get(DELIVERY_ID_HEADER);
+const { deliveryId } = readWebhookHeaders(req.headers);
 if (await alreadyHandled(deliveryId)) return new Response(null, { status: 204 });
 ```
 
+`readWebhookHeaders` prefers the `x-inboundr-*` names and falls back to the legacy `x-inbound-*` ones, so read headers through it rather than by name.
+
 The email's own `id` is **not** a substitute — a message fanned out to several endpoints shares it.
+
+### When the body is missing
+
+Some hosts and proxies drop request bodies. The headers still arrive, carrying a second signature over just the delivery and email ids. A signed request with an empty or absent body fails with `reason: "missing_body"` (an unsigned one is `missing_header`); verify the ids and fetch the email instead:
+
+```ts
+import { verifyWebhook, verifyWebhookIds, InboundrSignatureError } from "inboundr";
+
+try {
+  const { email } = await verifyWebhook(req, secret);
+  await handle(email);
+} catch (err) {
+  if (err instanceof InboundrSignatureError && err.reason === "missing_body") {
+    const { emailId } = await verifyWebhookIds(req.headers, secret);
+    await handle(await inboundr.emails.get(emailId));
+  } else throw err;
+}
+```
+
+The id signature proves only that Inboundr sent a delivery naming that email, so fetching it through the API is the one safe use of it.
 
 ### Why a verification failed
 
@@ -106,10 +128,11 @@ The email's own `id` is **not** a substitute — a message fanned out to several
 | `reason` | What happened |
 |---|---|
 | `missing_header` | No signature header. Not ours, or a proxy stripped it. |
+| `missing_body` | Signed, but the body is empty — the host dropped it. Use `verifyWebhookIds`. |
 | `malformed_header` | Header present but not `t=…,v1=…`. |
 | `invalid_signature` | MAC did not match. Wrong secret, or a forgery. |
 | `timestamp_out_of_tolerance` | Authentic, but outside the replay window. |
-| `body_already_read` | Something consumed the body first. |
+| `body_already_read` | Something consumed or parsed the body first. |
 | `invalid_payload` | Verified, but not an envelope this version knows. |
 | `missing_secret` | No secret passed in. Usually an unset env var. |
 
@@ -128,26 +151,55 @@ const inboundr = new Inboundr(); // reads INBOUNDR_API_KEY
 const { data } = await inboundr.emails.list({ direction: "inbound", limit: 20 });
 const email = await inboundr.emails.get(data[0].id);
 
-await inboundr.emails.send({
+const sent = await inboundr.emails.send({
   from: "agent@mail.yourdomain.com",
   to: ["customer@example.com"],
   subject: "Re: your order",
   text: "Shipped this morning.",
-});
+}); // { id, messageId, threadId }
+
+await inboundr.emails.reply(email.id, { text: "On it." });
 ```
 
 | Resource | What it covers |
 |---|---|
-| `emails` | List, get, send, delete, retry deliveries, attachment URLs |
+| `emails` | List, get, send, reply, delete, retry deliveries, attachments |
 | `threads` | A whole conversation, oldest first |
 | `domains` | Register, verify, catch-all wiring |
 | `addresses` | The inboxes your agents read |
-| `endpoints` | Webhook and forwarding destinations, plus test deliveries |
-| `shieldRules` | Filtering — allow, block, reroute, and rule ordering |
+| `endpoints` | Webhook and forwarding destinations, test deliveries, delivery history |
+| `shieldRules` | Filtering — allow, block, reroute; move one rule or reorder all |
+| `senders` | Which From addresses your connected senders allow |
 | `suppressions` | Addresses you can no longer send to |
 | `forwardDestinations` | Consent for forwarding targets |
 
+Every operation in the API has a method; a test fails the build if one doesn't.
+
 Constructor: `{ apiKey, baseUrl, fetch, timeoutMs }`. Injecting `fetch` is how you test against a stub without touching the network.
+
+### Pagination
+
+`emails.list` and `endpoints.deliveries` return one page and a `nextCursor`. To walk all of them, iterate instead:
+
+```ts
+for await (const email of inboundr.emails.listAll({ direction: "inbound" })) {
+  if (seen(email.id)) break; // stops fetching
+}
+```
+
+Pages are fetched as you go, and each one counts against the account's rate limit.
+
+### Updating a shield rule
+
+`shieldRules.update` replaces the whole rule, and accepts a rule straight from `get`:
+
+```ts
+const rule = await inboundr.shieldRules.get(id);
+await inboundr.shieldRules.update(id, { ...rule, enabled: false });
+await inboundr.shieldRules.move(id, "up");
+```
+
+Request bodies are strict: a field the API doesn't accept is a `400`, and a compile error before that.
 
 ### Attachments
 
@@ -155,6 +207,10 @@ Webhook bodies carry metadata only — a base64'd 40 MB PDF in a webhook is a ti
 
 ```ts
 const { url } = await inboundr.emails.attachmentUrl(email.id, 0);
+
+// Or stream the bytes through the API, when the storage host isn't reachable:
+const file = await inboundr.emails.downloadAttachment(email.id, 0);
+const bytes = await file.arrayBuffer();
 ```
 
 `stored: false` means nothing was kept to download — the plan does not store attachments, or the message exceeded its size cap.
@@ -198,26 +254,30 @@ If you want an agent to talk to Inboundr *directly* rather than through your app
 
 ## Maintaining the platform contract
 
-This repository holds only the client. The API it talks to and the server that signs its webhooks live elsewhere, which has one consequence worth being blunt about:
+The API this talks to and the server that signs its webhooks live in another repository. The types are kept honest by generating them from the platform's OpenAPI description rather than writing them by hand:
 
-**Nothing here can detect a platform-side change.** There is no codegen and no shared types. If a response gains, loses or renames a field, this package's build stays green and its types quietly become wrong. Green CI means the client is self-consistent, not that it matches production.
+- **[`openapi/openapi.yaml`](./openapi/openapi.yaml)** — copied from the platform, where it is itself generated from the validators the API runs. Never edited here.
+- **[`src/generated/api.ts`](./src/generated/api.ts)** — generated from it by `openapi-typescript`. [`src/types.ts`](./src/types.ts) only gives those shapes stable names.
+- **[`tests/spec.test.mjs`](./tests/spec.test.mjs)** — calls every client method and fails if an operation in the spec has none, or a method calls something the spec doesn't describe.
+- **[`tests/webhook.test.mjs`](./tests/webhook.test.mjs)** — the signing spec, stated in full in its header and implemented independently with `node:crypto`. Signatures aren't in the OpenAPI description, so this one is still by hand, and a change to the scheme is a **breaking change** to this package.
 
-So the contract is maintained by hand, in two places:
+When the platform's API changes:
 
-- **[`src/types.ts`](./src/types.ts)** — the wire types, written against the `/api/v1` routes.
-- **[`tests/webhook.test.mjs`](./tests/webhook.test.mjs)** — the signing spec, stated in full in that file's header and implemented independently with `node:crypto` so it cross-checks the SDK's WebCrypto path.
-
-A change to the signing scheme is a **breaking change** to this package.
+```bash
+npm run spec:sync   # copy ../inbound-app/openapi/openapi.yaml (or $INBOUNDR_SPEC), regenerate types
+npm test            # type errors and coverage failures show what the client needs
+```
 
 ## Development
 
 ```bash
 npm install
-npm run build   # tsc → dist/
-npm test        # build, then both suites (46 tests)
+npm test            # spec:check, build, webhook/client/spec suites, type tests
+npm run spec:sync   # pull the platform's spec and regenerate types
+npm run spec:check  # fail if src/generated/api.ts is stale (part of npm test)
 ```
 
-Releases are cut by tagging. `v0.1.0` on `main` runs the Node 18/20/22 matrix and, if green, publishes with provenance. CI checks the tag against `version` in `package.json`, because npm publishes what the file says and ignores the tag.
+Releases are cut by tagging. `v0.2.0` on `main` runs the Node 18/20/22 matrix and, if green, publishes with provenance. CI checks the tag against `version` in `package.json`, because npm publishes what the file says and ignores the tag.
 
 ## License
 

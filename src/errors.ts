@@ -72,8 +72,10 @@ export class InboundrRateLimitError extends InboundrApiError {
 
 /** Why a webhook failed verification. Stable strings — safe to switch on. */
 export type SignatureFailureReason =
-  /** No `x-inbound-signature` header at all. Not one of ours, or a proxy ate it. */
+  /** A required header is absent. Not one of ours, or a proxy ate it. */
   | "missing_header"
+  /** The body is empty — the host dropped it. Use `verifyWebhookIds` instead. */
+  | "missing_body"
   /** Header present but not `t=<unix>,v1=<hex>`. */
   | "malformed_header"
   /** Signature is valid but the timestamp is outside the replay window. */

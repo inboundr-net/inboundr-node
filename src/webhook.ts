@@ -19,10 +19,10 @@ import { InboundrSignatureError } from "./errors.js";
 import type { InboundrEvent } from "./types.js";
 
 /** Carries `t=<unix>,v1=<hmac>`. Verify against this, not the body alone. */
-export const SIGNATURE_HEADER = "x-inbound-signature";
+export const SIGNATURE_HEADER = "x-inboundr-signature";
 
 /** The event name, mirroring the body's `event` field. */
-export const EVENT_HEADER = "x-inbound-event";
+export const EVENT_HEADER = "x-inboundr-event";
 
 /**
  * Unique per delivery attempt — the idempotency key for your handler.
@@ -32,7 +32,77 @@ export const EVENT_HEADER = "x-inbound-event";
  * email's own `id` is *not* a substitute: a message fanned out to several
  * endpoints, or retried after your 500, shares it.
  */
-export const DELIVERY_ID_HEADER = "x-inbound-delivery-id";
+export const DELIVERY_ID_HEADER = "x-inboundr-delivery-id";
+
+/** The email a delivery carries, so a handler that lost the body can fetch it. */
+export const EMAIL_ID_HEADER = "x-inboundr-email-id";
+
+/**
+ * Signs the delivery and email ids without the body — see
+ * {@link verifyWebhookIds}. Same `t=<unix>,v1=<hex>` format and secret.
+ */
+export const ID_SIGNATURE_HEADER = "x-inboundr-id-signature";
+
+/**
+ * The original `x-inbound-*` spellings. The platform still sends both, with
+ * identical values; these are read only as a fallback, so a handler behind a
+ * proxy that allow-lists the old names keeps working.
+ */
+export const LEGACY_SIGNATURE_HEADER = "x-inbound-signature";
+export const LEGACY_DELIVERY_ID_HEADER = "x-inbound-delivery-id";
+
+/**
+ * Anything request headers come as: a web `Headers` (or a polyfill's — only
+ * `.get` is used, never `instanceof`), or a plain object such as Express's or
+ * Node's `req.headers`, matched case-insensitively.
+ */
+export type HeadersLike =
+  | { get(name: string): string | null | undefined }
+  | Record<string, string | string[] | undefined>;
+
+/** The platform headers on a delivery, legacy spellings already folded in. */
+export type WebhookHeaders = {
+  signature: string | null;
+  idSignature: string | null;
+  deliveryId: string | null;
+  emailId: string | null;
+  event: string | null;
+};
+
+function headerReader(headers: HeadersLike): (name: string) => string | null {
+  if (typeof (headers as { get?: unknown }).get === "function") {
+    const get = (headers as { get(name: string): string | null | undefined }).get.bind(headers);
+    return (name) => get(name) ?? null;
+  }
+  const record = headers as Record<string, string | string[] | undefined>;
+  const lower = new Map<string, string | string[] | undefined>();
+  for (const [key, value] of Object.entries(record)) lower.set(key.toLowerCase(), value);
+  return (name) => {
+    const value = lower.get(name);
+    return (Array.isArray(value) ? value[0] : value) ?? null;
+  };
+}
+
+/**
+ * Reads the delivery headers, preferring the `x-inboundr-*` names and falling
+ * back to the legacy `x-inbound-*` ones. The one place that fallback lives:
+ * the verifiers use it, and so should a handler reading the delivery id for
+ * deduplication.
+ *
+ * ```ts
+ * const { deliveryId } = readWebhookHeaders(req.headers);
+ * ```
+ */
+export function readWebhookHeaders(headers: HeadersLike): WebhookHeaders {
+  const get = headerReader(headers);
+  return {
+    signature: get(SIGNATURE_HEADER) ?? get(LEGACY_SIGNATURE_HEADER),
+    idSignature: get(ID_SIGNATURE_HEADER),
+    deliveryId: get(DELIVERY_ID_HEADER) ?? get(LEGACY_DELIVERY_ID_HEADER),
+    emailId: get(EMAIL_ID_HEADER),
+    event: get(EVENT_HEADER) ?? get("x-inbound-event"),
+  };
+}
 
 /**
  * How far a timestamp may be from now, in seconds.
@@ -138,27 +208,8 @@ function asEvent(value: unknown): InboundrEvent | null {
   return value as InboundrEvent;
 }
 
-/**
- * Verifies a raw body against its signature header and returns the typed event.
- *
- * The framework-agnostic form. Reach for it when you don't have a web `Request`
- * — Express, Fastify, Hono's raw mode, a queue consumer replaying a stored
- * payload. If you do have a `Request`, use {@link verifyWebhook}.
- *
- * `body` must be the **exact bytes** we sent, as text. Anything that round-trips
- * through a JSON parser will fail: `JSON.stringify(JSON.parse(body))` reorders
- * nothing but does change whitespace and unicode escapes, and the MAC covers the
- * bytes, not the meaning. In Express that means `express.raw()`, not
- * `express.json()`.
- *
- * @throws {InboundrSignatureError} on any failure. Respond 400 and drop it.
- */
-export async function verifyWebhookPayload(
-  body: string,
-  signatureHeader: string | null | undefined,
-  secret: string,
-  options: VerifyWebhookOptions = {},
-): Promise<InboundrEvent> {
+/** A missing secret is the caller's bug, so it is reported before anything else. */
+function requireSecret(secret: string): void {
   if (!secret) {
     throw new InboundrSignatureError(
       "missing_secret",
@@ -167,24 +218,60 @@ export async function verifyWebhookPayload(
         "process.env.INBOUNDR_WEBHOOK_SECRET).",
     );
   }
+}
 
-  if (!signatureHeader) {
+function requireHeader(
+  value: string | null | undefined,
+  headerName: string,
+): asserts value is string {
+  if (!value) {
     throw new InboundrSignatureError(
       "missing_header",
-      `Request has no ${SIGNATURE_HEADER} header, so it cannot be from Inboundr. ` +
+      `Request has no ${headerName} header, so it cannot be from Inboundr. ` +
         "If you are behind a proxy, check that it forwards x-* headers.",
     );
   }
+}
+
+/** Raw body bytes as the text that was signed, or why there's nothing to hash. */
+function bodyText(body: unknown): string {
+  if (typeof body === "string") return body;
+  if (body instanceof Uint8Array) return new TextDecoder().decode(body);
+  if (body instanceof ArrayBuffer) return new TextDecoder().decode(new Uint8Array(body));
+  if (body === undefined || body === null) return "";
+  // body-parser leaves `{}` when there was no body to read.
+  if (typeof body === "object" && Object.keys(body).length === 0) return "";
+  throw new InboundrSignatureError(
+    "body_already_read",
+    "The body was already parsed, so the bytes that were signed are gone. Pass " +
+      "the raw body: in Express use express.raw({ type: \"application/json\" }), " +
+      "not express.json().",
+  );
+}
+
+/**
+ * Checks a `t=<unix>,v1=<hex>` header against `message(timestamp)`, then the
+ * replay window. Shared by the body signature and the id signature, which
+ * differ only in the string that was signed.
+ */
+async function verifySignedMessage(
+  signatureHeader: string | null | undefined,
+  headerName: string,
+  secret: string,
+  message: (timestamp: number) => string,
+  options: VerifyWebhookOptions,
+): Promise<void> {
+  requireHeader(signatureHeader, headerName);
 
   const parsed = parseSignatureHeader(signatureHeader);
   if (!parsed) {
     throw new InboundrSignatureError(
       "malformed_header",
-      `Could not parse the ${SIGNATURE_HEADER} header. Expected "t=<unix>,v1=<hex>".`,
+      `Could not parse the ${headerName} header. Expected "t=<unix>,v1=<hex>".`,
     );
   }
 
-  const expected = await hmacHex(secret, `${parsed.timestamp}.${body}`);
+  const expected = await hmacHex(secret, message(parsed.timestamp));
   const matched = parsed.macs.some((mac) => timingSafeEqualHex(mac, expected));
 
   // Signature before freshness, deliberately. Both end in a rejection, but only
@@ -215,6 +302,58 @@ export async function verifyWebhookPayload(
         "raise toleranceSeconds if you are intentionally replaying old payloads.",
     );
   }
+}
+
+/**
+ * Verifies a raw body against its signature header and returns the typed event.
+ *
+ * The framework-agnostic form. Reach for it when you don't have a web `Request`
+ * — Express, Fastify, Hono's raw mode, a queue consumer replaying a stored
+ * payload. If you do have a `Request`, use {@link verifyWebhook}.
+ *
+ * `rawBody` must be the **exact bytes** we sent, as a string or the raw bytes
+ * (a `Buffer` is fine). Anything that round-trips through a JSON parser will
+ * fail: `JSON.stringify(JSON.parse(body))` changes whitespace and unicode
+ * escapes, and the MAC covers the bytes, not the meaning. In Express that means
+ * `express.raw()`, not `express.json()`. An empty or absent body is reported as
+ * `missing_body`.
+ *
+ * `signature` is the signature header's value, or the request's headers (any
+ * shape — see {@link HeadersLike}), which also applies the legacy fallback.
+ *
+ * @throws {InboundrSignatureError} on any failure. Respond 400 and drop it.
+ */
+export async function verifyWebhookPayload(
+  rawBody: string | Uint8Array | ArrayBuffer | null | undefined,
+  signature: string | null | undefined | HeadersLike,
+  secret: string,
+  options: VerifyWebhookOptions = {},
+): Promise<InboundrEvent> {
+  requireSecret(secret);
+  const signatureHeader =
+    typeof signature === "string" || signature == null
+      ? signature
+      : readWebhookHeaders(signature).signature;
+  // Header before body: an unsigned empty request is a probe, not a delivery
+  // whose body was dropped, and must not be steered toward verifyWebhookIds.
+  requireHeader(signatureHeader, SIGNATURE_HEADER);
+  const body = bodyText(rawBody);
+  if (body === "") {
+    throw new InboundrSignatureError(
+      "missing_body",
+      "The request arrived with an empty body. Some hosts and proxies drop it; " +
+        "the headers still carry the email's id, so verify them with " +
+        "verifyWebhookIds and fetch the email with inboundr.emails.get(emailId).",
+    );
+  }
+
+  await verifySignedMessage(
+    signatureHeader,
+    SIGNATURE_HEADER,
+    secret,
+    (t) => `${t}.${body}`,
+    options,
+  );
 
   let decoded: unknown;
   try {
@@ -279,7 +418,77 @@ export async function verifyWebhook(
     );
   }
 
-  const signature = request.headers.get(SIGNATURE_HEADER);
   const body = await request.text();
-  return verifyWebhookPayload(body, signature, secret, options);
+  return verifyWebhookPayload(body, request.headers, secret, options);
+}
+
+/** The three values {@link verifyWebhookIds} checks, passed directly. */
+export type WebhookIdValues = {
+  signature: string | null | undefined;
+  deliveryId: string | null | undefined;
+  emailId: string | null | undefined;
+};
+
+/** Told apart from a plain header record by its camelCase keys, which no
+    HTTP header name has. */
+function isIdValues(value: HeadersLike | WebhookIdValues): value is WebhookIdValues {
+  if (typeof (value as { get?: unknown }).get === "function") return false;
+  return "signature" in value || "deliveryId" in value || "emailId" in value;
+}
+
+/**
+ * Verifies the id signature on a delivery that arrived without its body.
+ *
+ * Some hosts and proxies drop request bodies. The headers still arrive, and
+ * {@link ID_SIGNATURE_HEADER} signs the delivery and email ids on their own:
+ * `HMAC-SHA256(secret, "ids." + t + "." + deliveryId + "." + emailId)`, with the
+ * same secret and replay window as the body signature.
+ *
+ * **All this proves is that Inboundr sent a delivery naming this email.** It
+ * does not cover any body, so the only safe thing to do with the result is
+ * fetch the email through the API:
+ *
+ * ```ts
+ * const { emailId } = await verifyWebhookIds(req.headers, secret);
+ * const email = await inboundr.emails.get(emailId);
+ * ```
+ *
+ * Accepts the request's headers in any shape ({@link HeadersLike}, with the
+ * legacy delivery-id fallback), or the three values directly.
+ *
+ * @throws {InboundrSignatureError} on any failure. Respond 400 and drop it.
+ */
+export async function verifyWebhookIds(
+  headers: HeadersLike | WebhookIdValues,
+  secret: string,
+  options: VerifyWebhookOptions = {},
+): Promise<{ deliveryId: string; emailId: string }> {
+  requireSecret(secret);
+  const values = isIdValues(headers)
+    ? headers
+    : (({ idSignature, deliveryId, emailId }) => ({
+        signature: idSignature,
+        deliveryId,
+        emailId,
+      }))(readWebhookHeaders(headers));
+
+  if (!values.deliveryId || !values.emailId) {
+    throw new InboundrSignatureError(
+      "missing_header",
+      `Request is missing ${DELIVERY_ID_HEADER} or ${EMAIL_ID_HEADER}, so there ` +
+        "is nothing to verify the id signature against.",
+    );
+  }
+  const { deliveryId, emailId } = values;
+
+  await verifySignedMessage(
+    values.signature,
+    ID_SIGNATURE_HEADER,
+    secret,
+    // The `ids.` prefix is what keeps this apart from a body signature under
+    // the same key; see the platform's webhook-signature.ts.
+    (t) => `ids.${t}.${deliveryId}.${emailId}`,
+    options,
+  );
+  return { deliveryId, emailId };
 }

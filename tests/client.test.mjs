@@ -334,6 +334,88 @@ await test("a transport failure is wrapped with the call that caused it", async 
   });
 });
 
+// --- 0.2.0 methods -------------------------------------------------------------
+
+await test("listAll follows nextCursor across pages and stops at the end", async () => {
+  const pages = [
+    { data: [{ id: "em_1" }, { id: "em_2" }], nextCursor: "c1" },
+    { data: [{ id: "em_3" }], nextCursor: null },
+  ];
+  const urls = [];
+  const inboundr = new Inboundr({
+    apiKey: KEY,
+    fetch: async (url) => {
+      urls.push(url);
+      return Response.json(pages[urls.length - 1]);
+    },
+  });
+  const ids = [];
+  for await (const email of inboundr.emails.listAll({ direction: "inbound", limit: 2 })) {
+    ids.push(email.id);
+  }
+  assert.deepEqual(ids, ["em_1", "em_2", "em_3"]);
+  assert.equal(urls.length, 2);
+  assert.match(urls[0], /direction=inbound/);
+  assert.doesNotMatch(urls[0], /cursor=/);
+  assert.match(urls[1], /cursor=c1/);
+  assert.match(urls[1], /limit=2/);
+});
+
+await test("breaking out of listAll stops fetching pages", async () => {
+  let requests = 0;
+  const inboundr = new Inboundr({
+    apiKey: KEY,
+    fetch: async () => {
+      requests++;
+      return Response.json({ data: [{ id: "a" }, { id: "b" }], nextCursor: "more" });
+    },
+  });
+  for await (const _ of inboundr.emails.listAll()) break;
+  assert.equal(requests, 1);
+});
+
+await test("downloadAttachment returns the raw Response with ?download=1", async () => {
+  const urls = [];
+  const inboundr = new Inboundr({
+    apiKey: KEY,
+    fetch: async (url) => {
+      urls.push(url);
+      return new Response(new Uint8Array([37, 80, 68, 70]), {
+        headers: { "content-type": "application/pdf" },
+      });
+    },
+  });
+  const response = await inboundr.emails.downloadAttachment("em_1", 2);
+  assert.ok(response instanceof Response);
+  assert.equal(response.headers.get("content-type"), "application/pdf");
+  assert.deepEqual([...new Uint8Array(await response.arrayBuffer())], [37, 80, 68, 70]);
+  assert.match(urls[0], /\/api\/v1\/emails\/em_1\/attachments\/2\?download=1$/);
+});
+
+await test("a failed download still throws InboundrApiError", async () => {
+  const { inboundr } = client({ status: 402, body: { error: "upgrade" } });
+  await assert.rejects(
+    () => inboundr.emails.downloadAttachment("em_1", 0),
+    (err) => err instanceof InboundrApiError && err.status === 402,
+  );
+});
+
+await test("reply posts to the email's reply route", async () => {
+  const { calls, inboundr } = client({ status: 201, body: { id: "em_2" } });
+  await inboundr.emails.reply("em_1", { text: "thanks", replyAll: true });
+  assert.equal(calls[0].method, "POST");
+  assert.match(calls[0].url, /\/emails\/em_1\/reply$/);
+  assert.deepEqual(JSON.parse(calls[0].body), { text: "thanks", replyAll: true });
+});
+
+await test("move sends the direction to the rule's move route", async () => {
+  const { calls, inboundr } = client({ body: { order: ["sr_2", "sr_1"] } });
+  const result = await inboundr.shieldRules.move("sr_1", "down");
+  assert.match(calls[0].url, /\/shield-rules\/sr_1\/move$/);
+  assert.deepEqual(JSON.parse(calls[0].body), { direction: "down" });
+  assert.deepEqual(result.order, ["sr_2", "sr_1"]);
+});
+
 console.log(`${passed} passed, ${failures.length} failed`);
 for (const f of failures) console.error(`  FAIL ${f}`);
 process.exit(failures.length === 0 ? 0 : 1);
