@@ -21,7 +21,7 @@ yarn add inboundr
 bun add inboundr
 ```
 
-No runtime dependencies. Runs on Node 18+, Bun, Deno, Cloudflare Workers and Vercel Edge.
+No runtime dependencies. Runs on Node 20+, Bun, Deno, Cloudflare Workers and Vercel Edge.
 
 ## Setup
 

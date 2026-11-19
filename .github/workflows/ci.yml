@@ -15,10 +15,11 @@ jobs:
       # The matrix is the point, not ceremony. This package claims to run on any
       # runtime with `fetch` and `crypto.subtle` and it has no dependencies to
       # paper over a gap, so the floor named in `engines` has to be tested
-      # rather than assumed. Node 18 is the oldest version we promise; drop it
+      # rather than assumed. Node 20 is the oldest version we promise (18 has no
+      # global crypto, which verification needs); drop it
       # here and from `engines` in the same commit, never just one.
       matrix:
-        node: ["18", "20", "22"]
+        node: ["20", "22", "24"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

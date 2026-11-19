@@ -14,7 +14,7 @@
  * who knows which. `InboundrRateLimitError.retryAfterSeconds` carries the
  * server's own answer for when you do.
  *
- * Built on global `fetch` and nothing else, so it runs on Node 18+, Bun, Deno,
+ * Built on global `fetch` and nothing else, so it runs on Node 20+, Bun, Deno,
  * Cloudflare Workers and Vercel Edge unchanged.
  */
 

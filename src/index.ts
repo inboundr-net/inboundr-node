@@ -9,7 +9,7 @@
  *   endpoints and rules, and for reading or sending mail.
  *
  * Everything is built on web globals — `fetch`, `crypto.subtle`, `TextEncoder` —
- * with no dependencies, so it runs on Node 18+, Bun, Deno, Cloudflare Workers
+ * with no dependencies, so it runs on Node 20+, Bun, Deno, Cloudflare Workers
  * and Vercel Edge unchanged.
  */
 

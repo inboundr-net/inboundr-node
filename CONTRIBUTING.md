@@ -34,4 +34,4 @@ The signing scheme isn't part of the OpenAPI spec. It is written out at the top 
 2. Merge to `main`.
 3. Tag `v<version>` and push the tag.
 
-CI runs the tests on Node 18, 20 and 22, checks that the tag matches `package.json`, and publishes to npm with provenance. Publishing needs the `NPM_TOKEN` repository secret.
+CI runs the tests on Node 20, 22 and 24, checks that the tag matches `package.json`, and publishes to npm with provenance. Publishing needs the `NPM_TOKEN` repository secret.
