@@ -41,17 +41,21 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      # Required for npm provenance, which attests on the public registry that
-      # this tarball was built from this commit in this repo. Free trust signal
-      # for a package asking people to route their mail through it.
+      # npm trusted publishing: GitHub issues an OIDC token that npm accepts
+      # for this repo and this workflow file (ci.yml), so no NPM_TOKEN secret
+      # exists to leak. The same token signs the provenance statement npm
+      # adds automatically for a public repo.
       id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          # Trusted publishing needs Node 22.14+ and npm 11.5.1+; staging
+          # needs npm 11.15+.
+          node-version: "24"
           registry-url: "https://registry.npmjs.org"
           cache: npm
+      - run: npm install -g npm@^11.15.0 --no-audit --no-fund
       - run: npm ci --no-audit --no-fund
 
       # Guard against the mismatch that is only discoverable after the fact:
@@ -67,6 +71,7 @@ jobs:
             exit 1
           fi
 
-      - run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # Staged, not live: the version waits on npmjs.com (Staged Packages) until
+      # a maintainer approves it with 2FA. CI can submit a release but never
+      # ship one on its own.
+      - run: npm stage publish --access public

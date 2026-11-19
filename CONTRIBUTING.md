@@ -33,5 +33,6 @@ The signing scheme isn't part of the OpenAPI spec. It is written out at the top 
 1. Bump `version` in `package.json`.
 2. Merge to `main`.
 3. Tag `v<version>` and push the tag.
+4. Approve the staged version on npmjs.com (**inboundr → Staged Packages**), or with `npm stage list inboundr` and `npm stage approve <id>`. Approval needs 2FA.
 
-CI runs the tests on Node 20, 22 and 24, checks that the tag matches `package.json`, and publishes to npm with provenance. Publishing needs the `NPM_TOKEN` repository secret.
+CI runs the tests on Node 20, 22 and 24, checks that the tag matches `package.json`, and stages the version with `npm stage publish`. It authenticates through npm trusted publishing (repository `inboundr-net/inboundr-node`, workflow `ci.yml`), so there is no npm token, and npm adds provenance. Renaming `ci.yml` breaks publishing until the trusted publisher is updated on npmjs.com.
