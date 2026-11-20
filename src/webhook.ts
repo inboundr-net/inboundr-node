@@ -492,3 +492,60 @@ export async function verifyWebhookIds(
   );
   return { deliveryId, emailId };
 }
+
+/** A delivery whose body and ids both verified. `deliveryId` is signed. */
+export type VerifiedDelivery = { event: InboundrEvent; deliveryId: string };
+
+/**
+ * Verifies a delivery's body **and** its id signature, and returns the event
+ * with a delivery id that is safe to deduplicate retries on.
+ *
+ * The body signature covers only the body, so a delivery id read straight
+ * from the headers could be changed by someone replaying a captured delivery.
+ * This also checks `x-inboundr-id-signature`, and that it names the same email
+ * as the body.
+ *
+ * @throws {InboundrSignatureError} on any failure. Respond 400 and drop it.
+ */
+export async function verifyWebhookDeliveryPayload(
+  rawBody: string | Uint8Array | ArrayBuffer | null | undefined,
+  headers: HeadersLike,
+  secret: string,
+  options: VerifyWebhookOptions = {},
+): Promise<VerifiedDelivery> {
+  const event = await verifyWebhookPayload(rawBody, headers, secret, options);
+  const ids = await verifyWebhookIds(headers, secret, options);
+  if (ids.emailId !== event.email.id) {
+    throw new InboundrSignatureError(
+      "invalid_signature",
+      "The id signature names a different email than the body.",
+    );
+  }
+  return { event, deliveryId: ids.deliveryId };
+}
+
+/**
+ * {@link verifyWebhookDeliveryPayload} for a web `Request`. Reads the body,
+ * so call it before anything else does.
+ *
+ * ```ts
+ * const { event, deliveryId } = await verifyWebhookDelivery(req, secret);
+ * if (await alreadyHandled(deliveryId)) return new Response(null, { status: 204 });
+ * ```
+ *
+ * @throws {InboundrSignatureError} on any failure. Respond 400 and drop it.
+ */
+export async function verifyWebhookDelivery(
+  request: Request,
+  secret: string,
+  options: VerifyWebhookOptions = {},
+): Promise<VerifiedDelivery> {
+  if (request.bodyUsed) {
+    throw new InboundrSignatureError(
+      "body_already_read",
+      "The request body has already been read, so the signature cannot be " +
+        "checked against it. Call verifyWebhookDelivery(req, secret) first.",
+    );
+  }
+  return verifyWebhookDeliveryPayload(await request.text(), request.headers, secret, options);
+}

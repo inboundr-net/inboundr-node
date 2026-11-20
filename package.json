@@ -1,6 +1,6 @@
 {
   "name": "inboundr",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Node.js SDK for the Inboundr API: receive email over signed webhooks, read and reply to it.",
   "license": "MIT",
   "author": "inboundr <dev@inboundr.net>",

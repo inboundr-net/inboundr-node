@@ -85,13 +85,16 @@ app.post("/inbound", express.raw({ type: "application/json" }), async (req, res)
 
 ### Retries
 
-Failed deliveries are retried with the same delivery id. Use it to skip deliveries you have already handled:
+Failed deliveries are retried with the same delivery id. To skip deliveries you have already handled, verify with `verifyWebhookDelivery`, which also checks the signature on the delivery id:
 
 ```ts
-import { readWebhookHeaders } from "inboundr";
+import { verifyWebhookDelivery } from "inboundr";
 
-const { deliveryId } = readWebhookHeaders(req.headers);
+const { event, deliveryId } = await verifyWebhookDelivery(req, secret);
+if (await alreadyHandled(deliveryId)) return new Response(null, { status: 204 });
 ```
+
+With Express, use `verifyWebhookDeliveryPayload(req.body, req.headers, secret)`. Don't deduplicate on the `x-inboundr-delivery-id` header read directly: it isn't covered by the body's signature, so a replayed delivery could carry any id.
 
 ### Missing body
 

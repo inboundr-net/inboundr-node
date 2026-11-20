@@ -44,6 +44,8 @@ import {
   SIGNATURE_HEADER,
   readWebhookHeaders,
   verifyWebhook,
+  verifyWebhookDelivery,
+  verifyWebhookDeliveryPayload,
   verifyWebhookIds,
   verifyWebhookPayload,
 } from "../dist/index.js";
@@ -633,6 +635,45 @@ await test("verifyWebhookIds accepts Express's plain req.headers", async () => {
     { now },
   );
   assert.deepEqual(result, { deliveryId: DELIVERY_ID, emailId: EMAIL_ID });
+});
+
+// --- verifyWebhookDelivery: a delivery id you can deduplicate on ------------------
+
+function deliveryHeaders(overrides = {}) {
+  return {
+    [SIGNATURE_HEADER]: signPayload(SECRET, BODY, NOW_S),
+    [ID_SIGNATURE_HEADER]: signIds(SECRET, NOW_S, DELIVERY_ID, "eml_7Kq2mR"),
+    [DELIVERY_ID_HEADER]: DELIVERY_ID,
+    [EMAIL_ID_HEADER]: "eml_7Kq2mR",
+    ...overrides,
+  };
+}
+
+await test("verifyWebhookDelivery returns the event and a signed delivery id", async () => {
+  const { event, deliveryId } = await verifyWebhookDelivery(signedRequest(deliveryHeaders()), SECRET, { now });
+  assert.equal(deliveryId, DELIVERY_ID);
+  assert.equal(event.email.id, "eml_7Kq2mR");
+});
+
+await test("a replay with a forged delivery id is rejected", async () => {
+  // The body signature still passes; only the id signature catches this.
+  await assertRejects("invalid_signature", () =>
+    verifyWebhookDeliveryPayload(BODY, deliveryHeaders({ [DELIVERY_ID_HEADER]: "del_forged" }), SECRET, { now }),
+  );
+});
+
+await test("a replay with the id signature stripped is rejected", async () => {
+  const headers = deliveryHeaders();
+  delete headers[ID_SIGNATURE_HEADER];
+  await assertRejects("missing_header", () => verifyWebhookDeliveryPayload(BODY, headers, SECRET, { now }));
+});
+
+await test("id headers naming another email are rejected", async () => {
+  const headers = deliveryHeaders({
+    [EMAIL_ID_HEADER]: "em_other",
+    [ID_SIGNATURE_HEADER]: signIds(SECRET, NOW_S, DELIVERY_ID, "em_other"),
+  });
+  await assertRejects("invalid_signature", () => verifyWebhookDeliveryPayload(BODY, headers, SECRET, { now }));
 });
 
 console.log(`${passed} passed, ${failures.length} failed`);
