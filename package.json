@@ -1,7 +1,7 @@
 {
   "name": "inboundr",
-  "version": "0.2.0",
-  "description": "TypeScript SDK for Inboundr — inbound email for AI agents. Verify webhook signatures and call the REST API.",
+  "version": "0.2.1",
+  "description": "Node.js SDK for the Inboundr API: receive email over signed webhooks, read and reply to it.",
   "license": "MIT",
   "author": "inboundr <dev@inboundr.net>",
   "homepage": "https://inboundr.net",
